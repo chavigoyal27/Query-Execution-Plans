@@ -292,4 +292,259 @@ def get_optimizer_settings(connection) -> dict:
         for name, value, unit in rows
     }
 
+
+# ==========================
 # SECTION: AI INTEGRATION
+# ==========================
+
+def get_default_qep_system_prompt() -> str:
+    return (
+        "You are a PostgreSQL query optimization assistant. "
+        "Given a SQL SELECT query, return the best-fit execution approach as JSON only. "
+        "Your response must be valid JSON (no markdown, no code fences, no extra prose). "
+        "Always include a top-level key named 'steps' as an ordered array describing the plan. "
+        "Each step item must include: step_number, operation, objective, rationale. "
+        "Also include: recommended_plan_summary, indexes_to_consider, and assumptions. "
+        "Focus on PostgreSQL-compatible operations and practical optimizer behavior."
+    )
+
+# Build the user prompt for AI-assisted PostgreSQL query-plan recommendations.
+def build_qep_user_prompt(sql_query: str) -> str:
+
+    cleaned_query = (sql_query or "").strip()
+    if not cleaned_query:
+        raise ValueError("SQL query cannot be empty.")
+
+    if not cleaned_query.upper().startswith("SELECT "):
+        raise ValueError("Only SELECT queries are supported for AI planning.")
+
+    return (
+        "Analyze the following SQL query and return the best-fit PostgreSQL execution plan.\n\n"
+        "Requirements:\n"
+        "1) Return JSON only.\n"
+        "2) Include a 'steps' array in execution order.\n"
+        "3) Each steps item must include: step_number, operation, objective, rationale.\n"
+        "4) Include 'recommended_plan_summary', 'indexes_to_consider', and 'assumptions'.\n"
+        "5) Keep recommendations technically specific and concise.\n\n"
+        f"SQL Query:\n{cleaned_query}"
+    )
+
+# Load API key from .env file if not already set in environment variables.
+def _load_api_key_from_env_file():
+    import os
+    from pathlib import Path
+
+    env_candidates = [
+        Path(__file__).resolve().parent / ".env",
+        Path(__file__).resolve().parent.parent / ".env"
+    ]
+
+    for env_path in env_candidates:
+        if not env_path.exists():
+            continue
+
+        with env_path.open("r", encoding="utf-8") as file_handle:
+            for raw_line in file_handle:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+
+                if key and key not in os.environ:
+                    os.environ[key] = value
+
+
+def _extract_json_payload(text_content: str) -> dict:
+    import json
+
+    cleaned = text_content.strip()
+
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:].strip()
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("AI response did not contain a valid JSON object.")
+
+    return json.loads(cleaned[start:end + 1])
+
+# Build the user prompt for AI-assisted PostgreSQL query-plan recommendations.
+def build_qep_user_prompt(sql_query: str) -> str:
+
+    cleaned_query = (sql_query or "").strip()
+    if not cleaned_query:
+        raise ValueError("SQL query cannot be empty.")
+
+    if not cleaned_query.upper().startswith("SELECT "):
+        raise ValueError("Only SELECT queries are supported for AI planning.")
+
+    return (
+        "Analyze the following SQL query and return the best-fit PostgreSQL execution plan.\n\n"
+        "Requirements:\n"
+        "1) Return JSON only.\n"
+        "2) Include a 'steps' array in execution order.\n"
+        "3) Each steps item must include: step_number, operation, objective, rationale.\n"
+        "4) Include 'recommended_plan_summary', 'indexes_to_consider', and 'assumptions'.\n"
+        "5) Keep recommendations technically specific and concise.\n\n"
+        f"SQL Query:\n{cleaned_query}"
+    )
+
+# Load API key from .env file if not already set in environment variables.
+def _load_api_key_from_env_file():
+    import os
+    from pathlib import Path
+
+    env_candidates = [
+        Path(__file__).resolve().parent / ".env",
+        Path(__file__).resolve().parent.parent / ".env"
+    ]
+
+    for env_path in env_candidates:
+        if not env_path.exists():
+            continue
+
+        with env_path.open("r", encoding="utf-8") as file_handle:
+            for raw_line in file_handle:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+
+                if key and key not in os.environ:
+                    os.environ[key] = value
+
+
+def _extract_json_payload(text_content: str) -> dict:
+    import json
+
+    cleaned = text_content.strip()
+
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:].strip()
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("AI response did not contain a valid JSON object.")
+
+    return json.loads(cleaned[start:end + 1])
+
+
+# Generate a Query Execution Plan (QEP) using the Google Gemini AI model.
+def get_ai_query_execution_plan(
+    sql_query: str,
+    system_prompt: str | None = None,
+    model: str | None = None
+) -> dict:
+    import os
+    import json
+
+    _load_api_key_from_env_file()
+
+    gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("AI_API_KEY_GEMINI")
+    if not gemini_key:
+        raise RuntimeError("Gemini API key not found. Set GEMINI_API_KEY in environment or .env.")
+
+    prompt_system = system_prompt or get_default_qep_system_prompt()
+    prompt_user = build_qep_user_prompt(sql_query)
+    combined_prompt = f"System:\n{prompt_system}\n\nUser:\n{prompt_user}"
+
+    # Normalize model name for genai client: use the final path segment (e.g. 'gemini-2.5-flash')
+    raw_model = model or os.getenv("GEMINI_MODEL", "gemini-1.0")
+    selected_model = raw_model.split("/")[-1]
+
+    # Initialize genai client
+    try:
+        from google import genai
+    except Exception as e:
+        raise RuntimeError("genai library is required for Gemini calls. Install 'google-genai' or set up the SDK.") from e
+
+    try:
+        client = genai.Client(api_key=gemini_key)
+    except Exception as e:
+        raise RuntimeError(f"Failed to initialize genai client: {e}") from e
+
+    # Call the model
+    try:
+        response = client.models.generate_content(
+            model=selected_model,
+            contents=combined_prompt
+        )
+    except Exception as e:
+        raise RuntimeError(f"Gemini genai call failed: {e}") from e
+
+    # Extract textual response
+    response_text = None
+    # Preferred attribute
+    if hasattr(response, "text") and isinstance(response.text, str):
+        response_text = response.text
+    else:
+        # Try to convert to dict and inspect common shapes
+        parsed_resp = None
+        try:
+            if hasattr(response, "to_dict"):
+                parsed_resp = response.to_dict()
+            else:
+                parsed_resp = json.loads(str(response))
+        except Exception:
+            parsed_resp = None
+
+        if isinstance(parsed_resp, dict):
+            # candidates -> content
+            if "candidates" in parsed_resp and parsed_resp["candidates"]:
+                first = parsed_resp["candidates"][0]
+                if isinstance(first.get("content"), list):
+                    parts = []
+                    for item in first.get("content", []):
+                        if isinstance(item, dict) and item.get("text"):
+                            parts.append(item.get("text"))
+                        elif isinstance(item, str):
+                            parts.append(item)
+                    response_text = "\n".join([p for p in parts if p])
+                elif isinstance(first.get("text"), str):
+                    response_text = first.get("text")
+            # fallback: output -> content/text
+            if not response_text and "output" in parsed_resp:
+                out = parsed_resp["output"]
+                if isinstance(out, dict) and isinstance(out.get("content"), list):
+                    texts = [c.get("text") for c in out.get("content") if isinstance(c, dict) and c.get("text")]
+                    response_text = "\n".join([t for t in texts if t])
+                elif isinstance(out, str):
+                    response_text = out
+
+    if not response_text:
+        # Last resort: string representation
+        response_text = str(response)
+
+    # Extract JSON payload and validate
+    result = _extract_json_payload(response_text)
+
+    if not isinstance(result, dict):
+        raise RuntimeError("AI result is not a JSON object.")
+
+    steps = result.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise RuntimeError("AI result must include a non-empty 'steps' array.")
+
+    return result
