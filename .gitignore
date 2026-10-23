@@ -4,3 +4,5 @@ __pycache__/
 .env
 .env.*
 .vscode/
+.pdf-tools
+demo_output
