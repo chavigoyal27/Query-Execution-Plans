@@ -6,11 +6,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from preprocessing import get_ai_query_execution_plan
+from preprocessing import build_qep_user_prompt, get_ai_query_execution_plan
 
 
 def main():
-    # Delegate to preprocessing.get_ai_query_execution_plan (Gemini-first implementation)
     sample_query = """
     SELECT c.c_name,
            o.o_orderkey,
@@ -23,9 +22,27 @@ def main():
     GROUP BY c.c_name, o.o_orderkey
     ORDER BY total_amount DESC
     LIMIT 10;
-    """
+    """.strip()
 
-    print("Calling get_ai_query_execution_plan()...")
+    prompt = build_qep_user_prompt(sample_query)
+
+    required_fragments = [
+        "Return JSON only.",
+        "PostgreSQL QEP (JSON):",
+        '"Node Type"',
+        '"Plans"',
+        '"Startup Cost"',
+        '"Total Cost"',
+    ]
+
+    missing = [fragment for fragment in required_fragments if fragment not in prompt]
+    if missing:
+        raise AssertionError(f"Prompt missing expected JSON-plan instructions: {missing}")
+
+    print("Prompt validation passed.")
+    print(prompt)
+
+    print("\nCalling get_ai_query_execution_plan()...")
 
     try:
         response = get_ai_query_execution_plan(sample_query)

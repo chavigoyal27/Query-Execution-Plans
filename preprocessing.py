@@ -302,9 +302,8 @@ def get_default_qep_system_prompt() -> str:
         "You are a PostgreSQL query optimization assistant. "
         "Given a SQL SELECT query, return the best-fit execution approach as JSON only. "
         "Your response must be valid JSON (no markdown, no code fences, no extra prose). "
-        "Always include a top-level key named 'steps' as an ordered array describing the plan. "
-        "Each step item must include: step_number, operation, objective, rationale. "
-        "Also include: recommended_plan_summary, indexes_to_consider, and assumptions. "
+        "Match the structure of a PostgreSQL EXPLAIN JSON plan, including fields such as 'Node Type', 'Join Type', 'Startup Cost', 'Total Cost', 'Plan Rows', 'Plan Width', and nested 'Plans' arrays when relevant. "
+        "If helpful, include top-level keys like 'recommended_plan_summary', 'indexes_to_consider', and 'assumptions', but keep the output as a JSON object only. "
         "Focus on PostgreSQL-compatible operations and practical optimizer behavior."
     )
 
@@ -318,15 +317,77 @@ def build_qep_user_prompt(sql_query: str) -> str:
     if not cleaned_query.upper().startswith("SELECT "):
         raise ValueError("Only SELECT queries are supported for AI planning.")
 
+    example_json = '''{
+  "Node Type": "Hash Join",
+  "Parallel Aware": false,
+  "Async Capable": false,
+  "Join Type": "Inner",
+  "Startup Cost": 23.25,
+  "Total Cost": 39.82,
+  "Plan Rows": 500,
+  "Plan Width": 23,
+  "Disabled": false,
+  "Inner Unique": true,
+  "Hash Cond": "(o.o_custkey = c.c_custkey)",
+  "Plans": [
+    {
+      "Node Type": "Seq Scan",
+      "Parent Relationship": "Outer",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Relation Name": "orders",
+      "Alias": "o",
+      "Startup Cost": 0.0,
+      "Total Cost": 15.25,
+      "Plan Rows": 500,
+      "Plan Width": 8,
+      "Disabled": false,
+      "Filter": "(o_totalprice > '1000'::numeric)"
+    },
+    {
+      "Node Type": "Hash",
+      "Parent Relationship": "Inner",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Startup Cost": 17.0,
+      "Total Cost": 17.0,
+      "Plan Rows": 500,
+      "Plan Width": 23,
+      "Disabled": false,
+      "Plans": [
+        {
+          "Node Type": "Seq Scan",
+          "Parent Relationship": "Outer",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Relation Name": "customer",
+          "Alias": "c",
+          "Startup Cost": 0.0,
+          "Total Cost": 17.0,
+          "Plan Rows": 500,
+          "Plan Width": 23,
+          "Disabled": false
+        }
+      ]
+    }
+  ]
+}'''
+
     return (
         "Analyze the following SQL query and return the best-fit PostgreSQL execution plan.\n\n"
         "Requirements:\n"
         "1) Return JSON only.\n"
-        "2) Include a 'steps' array in execution order.\n"
-        "3) Each steps item must include: step_number, operation, objective, rationale.\n"
-        "4) Include 'recommended_plan_summary', 'indexes_to_consider', and 'assumptions'.\n"
-        "5) Keep recommendations technically specific and concise.\n\n"
-        f"SQL Query:\n{cleaned_query}"
+        "2) Do not include markdown fences, explanation text, or any prose outside the JSON object.\n"
+        "3) Follow the PostgreSQL EXPLAIN JSON format shown below, using realistic PostgreSQL node types, cost estimates, row counts, and nested 'Plans' arrays when appropriate.\n"
+        "4) Keep the response structurally similar to a PostgreSQL execution plan, with keys such as 'Node Type', 'Join Type', 'Startup Cost', 'Total Cost', 'Plan Rows', 'Plan Width', and 'Plans'.\n"
+        "5) If useful, include additional top-level fields such as 'recommended_plan_summary', 'indexes_to_consider', and 'assumptions', but keep them inside the same JSON object.\n\n"
+        "Example SQL:\n"
+        "SELECT c.c_name, o.o_orderkey\n"
+        "    FROM public.customer c\n"
+        "    JOIN public.orders o ON c.c_custkey = o.o_custkey\n"
+        "    WHERE o.o_totalprice > 1000;\n\n"
+        "PostgreSQL QEP (JSON):\n"
+        f"{example_json}\n"
     )
 
 # Load API key from .env file if not already set in environment variables.
@@ -378,78 +439,6 @@ def _extract_json_payload(text_content: str) -> dict:
         raise ValueError("AI response did not contain a valid JSON object.")
 
     return json.loads(cleaned[start:end + 1])
-
-# Build the user prompt for AI-assisted PostgreSQL query-plan recommendations.
-def build_qep_user_prompt(sql_query: str) -> str:
-
-    cleaned_query = (sql_query or "").strip()
-    if not cleaned_query:
-        raise ValueError("SQL query cannot be empty.")
-
-    if not cleaned_query.upper().startswith("SELECT "):
-        raise ValueError("Only SELECT queries are supported for AI planning.")
-
-    return (
-        "Analyze the following SQL query and return the best-fit PostgreSQL execution plan.\n\n"
-        "Requirements:\n"
-        "1) Return JSON only.\n"
-        "2) Include a 'steps' array in execution order.\n"
-        "3) Each steps item must include: step_number, operation, objective, rationale.\n"
-        "4) Include 'recommended_plan_summary', 'indexes_to_consider', and 'assumptions'.\n"
-        "5) Keep recommendations technically specific and concise.\n\n"
-        f"SQL Query:\n{cleaned_query}"
-    )
-
-# Load API key from .env file if not already set in environment variables.
-def _load_api_key_from_env_file():
-    import os
-    from pathlib import Path
-
-    env_candidates = [
-        Path(__file__).resolve().parent / ".env",
-        Path(__file__).resolve().parent.parent / ".env"
-    ]
-
-    for env_path in env_candidates:
-        if not env_path.exists():
-            continue
-
-        with env_path.open("r", encoding="utf-8") as file_handle:
-            for raw_line in file_handle:
-                line = raw_line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-
-                key, value = line.split("=", 1)
-                key = key.strip()
-                value = value.strip().strip('"').strip("'")
-
-                if key and key not in os.environ:
-                    os.environ[key] = value
-
-
-def _extract_json_payload(text_content: str) -> dict:
-    import json
-
-    cleaned = text_content.strip()
-
-    if cleaned.startswith("```"):
-        cleaned = cleaned.strip("`")
-        if cleaned.lower().startswith("json"):
-            cleaned = cleaned[4:].strip()
-
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        pass
-
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        raise ValueError("AI response did not contain a valid JSON object.")
-
-    return json.loads(cleaned[start:end + 1])
-
 
 # Generate a Query Execution Plan (QEP) using the Google Gemini AI model.
 def get_ai_query_execution_plan(
@@ -537,14 +526,31 @@ def get_ai_query_execution_plan(
         # Last resort: string representation
         response_text = str(response)
 
-    # Extract JSON payload and validate
+    # Extract JSON payload and validate. Accept both the legacy 'steps' format
+    # and the PostgreSQL EXPLAIN JSON/plan-like format requested by the prompt.
     result = _extract_json_payload(response_text)
 
     if not isinstance(result, dict):
         raise RuntimeError("AI result is not a JSON object.")
 
-    steps = result.get("steps")
-    if not isinstance(steps, list) or not steps:
-        raise RuntimeError("AI result must include a non-empty 'steps' array.")
+    has_steps = isinstance(result.get("steps"), list) and bool(result.get("steps"))
+    postgres_plan_keys = (
+        "Node Type",
+        "NodeType",
+        "Plans",
+        "Startup Cost",
+        "Total Cost",
+        "Plan Rows",
+        "Plan Width",
+        "Join Type",
+        "Relation Name",
+    )
+    has_postgres_plan_shape = any(key in result for key in postgres_plan_keys)
+
+    if not (has_steps or has_postgres_plan_shape):
+        raise RuntimeError(
+            "AI result must include either a non-empty 'steps' array or a PostgreSQL-style plan object "
+            "with keys such as 'Node Type', 'Plans', 'Startup Cost', and 'Total Cost'."
+        )
 
     return result
