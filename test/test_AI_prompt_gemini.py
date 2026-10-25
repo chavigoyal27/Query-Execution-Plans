@@ -1,5 +1,9 @@
+"""Offline prompt tests; pass --live when running this script to call Gemini."""
+
+import argparse
 import json
 import sys
+import unittest
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -9,7 +13,56 @@ if str(PROJECT_ROOT) not in sys.path:
 from preprocessing import build_qep_user_prompt, get_ai_query_execution_plan
 
 
+class QepUserPromptTests(unittest.TestCase):
+    def test_target_query_is_included_and_changes_the_prompt(self):
+        first_query = "SELECT * FROM alpha WHERE id = 1;"
+        second_query = "SELECT count(*) FROM beta;"
+
+        first_prompt = build_qep_user_prompt(first_query)
+        second_prompt = build_qep_user_prompt(second_query)
+
+        self.assertIn("SQL query to plan:\n" + first_query, first_prompt)
+        self.assertIn("SQL query to plan:\n" + second_query, second_prompt)
+        self.assertNotIn(second_query, first_prompt)
+        self.assertNotIn(first_query, second_prompt)
+        self.assertNotEqual(first_prompt, second_prompt)
+
+    def test_surrounding_whitespace_is_removed(self):
+        query = "SELECT * FROM alpha;"
+        self.assertEqual(build_qep_user_prompt(" \n" + query + "\n\t "),
+                         build_qep_user_prompt(query))
+
+    def test_multiline_query_is_preserved(self):
+        query = "SELECT id,\n       name\nFROM alpha\nWHERE name = 'A  B';"
+        self.assertIn("SQL query to plan:\n" + query + "\n\n",
+                      build_qep_user_prompt(query))
+
+    def test_example_is_explicitly_format_only(self):
+        prompt = build_qep_user_prompt("SELECT * FROM alpha;")
+        self.assertIn("Format-only example SQL:", prompt)
+        self.assertIn("do not copy the example's tables, predicates, indexes, or estimates.",
+                      prompt)
+        self.assertIn("Return JSON only.", prompt)
+        self.assertIn("PostgreSQL QEP (JSON):", prompt)
+        self.assertIn('"Node Type"', prompt)
+        self.assertIn('"Plans"', prompt)
+
+    def test_empty_query_is_rejected(self):
+        for query in (None, "", " \n\t "):
+            with self.subTest(query=query), self.assertRaisesRegex(ValueError, "cannot be empty"):
+                build_qep_user_prompt(query)
+
+    def test_non_select_query_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Only SELECT"):
+            build_qep_user_prompt("DELETE FROM alpha;")
+
+
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--live', action='store_true',
+                        help='Also request a plan from Gemini using the configured API key.')
+    args = parser.parse_args()
+
     sample_query = """
     SELECT c.c_name,
            o.o_orderkey,
@@ -41,6 +94,9 @@ def main():
 
     print("Prompt validation passed.")
     print(prompt)
+
+    if not args.live:
+        return
 
     print("\nCalling get_ai_query_execution_plan()...")
 

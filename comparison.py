@@ -14,6 +14,13 @@ import json
 import re
 
 
+def _strategy(node):
+    """Read an explicit strategy or the strategy implied by an aggregate alias."""
+    if node.get('Strategy') is not None:
+        return node['Strategy']
+    return {'HashAggregate': 'Hashed', 'GroupAggregate': 'Sorted'}.get(node['Node Type'])
+
+
 def _operation(node):
     name = node['Node Type']
     aliases = {
@@ -173,6 +180,7 @@ COMPARED_FIELDS = (
     'Index Cond', 'Recheck Cond', 'Hash Cond', 'Merge Cond', 'Join Filter',
     'Group Key', 'Sort Key', 'Presorted Key', 'Output', 'Subplan Name',
     'CTE Name', 'Function Name', 'Parallel Aware', 'Partial Mode',
+    'Workers Planned', 'Parent Relationship',
 )
 NARRATIVE_FIELDS = ('recommended_plan_summary', 'indexes_to_consider', 'assumptions')
 
@@ -233,7 +241,8 @@ def compare_plans(postgresql_plan, ai_plan):
     """Compare trees without database/API access; legacy steps remain supported.
 
     Matching uses unique (operator family, descendant relation/alias multiset)
-    anchors followed by uniquely identifiable children of matched parents.
+    anchors and uniquely identifiable children of matched parents, repeated
+    until no further pairs can be resolved.
     Operator methods may differ. Ties remain explicitly uncertain.
 
     difference_rate is the fraction of nodes affected by a recorded difference:
@@ -259,7 +268,7 @@ def compare_plans(postgresql_plan, ai_plan):
         matches[p] = a
         reverse[a] = p
 
-    # Group once for unique global anchors, independent of traversal order.
+    # Group unmatched nodes independently of traversal order.
     def groups(nodes, excluded, candidates=None):
         grouped = {}
         for node_id in (candidates if candidates is not None else nodes):
@@ -267,27 +276,28 @@ def compare_plans(postgresql_plan, ai_plan):
                 grouped.setdefault(key(nodes[node_id]), []).append(node_id)
         return grouped
 
-    p_groups = groups(pg, matches)
-    a_groups = groups(ai, reverse)
-    for anchor in p_groups.keys() & a_groups.keys():
-        if len(p_groups[anchor]) == len(a_groups[anchor]) == 1:
-            bind(p_groups[anchor][0], a_groups[anchor][0])
+    def bind_unique(p_groups, a_groups):
+        # Dictionary insertion order follows the supplied tree, so matching is
+        # deterministic without sorting potentially large relation scopes.
+        for anchor, p_candidates in p_groups.items():
+            a_candidates = a_groups.get(anchor, [])
+            if len(p_candidates) == len(a_candidates) == 1:
+                bind(p_candidates[0], a_candidates[0])
 
-    # Matched parents can disambiguate repeated operators in separate branches.
-    pending = list(matches.items())
-    processed = set()
-    while pending:
-        p, a = pending.pop()
-        if (p, a) in processed:
-            continue
-        processed.add((p, a))
-        pc = groups(pg, matches, pg[p]['children'])
-        ac = groups(ai, reverse, ai[a]['children'])
-        for anchor in pc.keys() & ac.keys():
-            if len(pc[anchor]) == len(ac[anchor]) == 1:
-                pp, aa = pc[anchor][0], ac[anchor][0]
-                bind(pp, aa)
-                pending.append((pp, aa))
+    # A contextual match can make another global pair unique, or disambiguate
+    # children of an already visited parent. Revisit both rules to a fixed point.
+    # Each successful pass binds at least one new pair, so this loop terminates.
+    while True:
+        previous_count = len(matches)
+        bind_unique(groups(pg, matches), groups(ai, reverse))
+        for p, a in list(matches.items()):
+            bind_unique(groups(pg, matches, pg[p]['children']),
+                        groups(ai, reverse, ai[a]['children']))
+        if len(matches) == previous_count:
+            break
+
+    remaining_pg = groups(pg, matches)
+    remaining_ai = groups(ai, reverse)
 
     differences = []
     similarities = []
@@ -303,6 +313,7 @@ def compare_plans(postgresql_plan, ai_plan):
 
     for p, a in sorted(matches.items(), key=lambda item: pg[item[0]]['path']):
         pn, an = pg[p], ai[a]
+        relationship_uncertain = False
         pn['counterpart_id'], an['counterpart_id'] = a, p
         context = ', '.join(s[2] or s[1] for s in pn['scope']) or pn['operator']
         if pn['operator'] != an['operator']:
@@ -315,30 +326,52 @@ def compare_plans(postgresql_plan, ai_plan):
                                  'explanation': f"Both use {pn['operator']} for {context}."})
         for field in COMPARED_FIELDS:
             pv, av = pn['attributes'].get(field), an['attributes'].get(field)
+            if field == 'Strategy':
+                # Preserve raw attributes for display, but compare the canonical
+                # strategy also implied by HashAggregate / GroupAggregate.
+                pv, av = _strategy(pn['attributes']), _strategy(an['attributes'])
             if pv != av:
                 record('attribute_changed', p, a,
                        {'field': field, 'postgresql': pv, 'ai': av,
                         'postgresql_present': field in pn['attributes'],
                         'ai_present': field in an['attributes']},
                        f"For {context}, {field} differs: PostgreSQL {pv!r}; AI {av!r}. "
-                       'An omitted field means unspecified, not necessarily absent at execution.')
+                       'An omitted field without an implied value means unspecified, '
+                       'not necessarily absent at execution.')
         # Compare actual immediate edges, preserving their order. Inserted helper
         # nodes remain visible and affect the structural comparison.
-        translated = [matches.get(c) for c in pn['children']]
-        if translated != an['children']:
+        children_changed = len(pn['children']) != len(an['children'])
+        for pc, ac in zip(pn['children'], an['children']):
+            if pc in matches:
+                children_changed |= matches[pc] != ac
+            elif ac in reverse or key(pg[pc]) != key(ai[ac]):
+                children_changed = True
+            else:
+                # Compatible unresolved children do not prove an edge changed.
+                relationship_uncertain = True
+        if children_changed:
             record('children_changed', p, a,
                    {'postgresql_children': pn['children'], 'ai_children': an['children']},
                    f'For {context}, ordered inputs differ (order, grouping, or extra/missing nodes).')
         pp, ap = pn['parent_id'], an['parent_id']
-        if (pp is None) != (ap is None) or (pp is not None and matches.get(pp) != ap):
+        parent_changed = (pp is None) != (ap is None)
+        if pp is not None and ap is not None:
+            if pp in matches:
+                parent_changed = matches[pp] != ap
+            elif ap in reverse or key(pg[pp]) != key(ai[ap]):
+                parent_changed = True
+            else:
+                relationship_uncertain = True
+        if parent_changed:
             record('parent_changed', p, a,
                    {'postgresql_parent': pp, 'ai_parent': ap},
                    f'For {context}, the node has a different position in the plan tree.')
-        pn['status'] = an['status'] = 'changed' if pn['difference_ids'] else 'unchanged'
+        pn['status'] = an['status'] = (
+            'changed' if pn['difference_ids'] else
+            'uncertain' if relationship_uncertain else 'unchanged'
+        )
 
     unresolved = []
-    remaining_pg = groups(pg, matches)
-    remaining_ai = groups(ai, reverse)
     for nodes, excluded, other_groups, source in (
         (pg, matches, remaining_ai, 'postgresql'), (ai, reverse, remaining_pg, 'ai')
     ):
