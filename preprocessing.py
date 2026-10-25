@@ -375,13 +375,17 @@ def build_qep_user_prompt(sql_query: str) -> str:
 
     return (
         "Analyze the following SQL query and return the best-fit PostgreSQL execution plan.\n\n"
+        "SQL query to plan:\n"
+        f"{cleaned_query}\n\n"
         "Requirements:\n"
         "1) Return JSON only.\n"
         "2) Do not include markdown fences, explanation text, or any prose outside the JSON object.\n"
         "3) Follow the PostgreSQL EXPLAIN JSON format shown below, using realistic PostgreSQL node types, cost estimates, row counts, and nested 'Plans' arrays when appropriate.\n"
         "4) Keep the response structurally similar to a PostgreSQL execution plan, with keys such as 'Node Type', 'Join Type', 'Startup Cost', 'Total Cost', 'Plan Rows', 'Plan Width', and 'Plans'.\n"
         "5) If useful, include additional top-level fields such as 'recommended_plan_summary', 'indexes_to_consider', and 'assumptions', but keep them inside the same JSON object.\n\n"
-        "Example SQL:\n"
+        "The example below demonstrates JSON format only. Plan the SQL query above; "
+        "do not copy the example's tables, predicates, indexes, or estimates.\n\n"
+        "Format-only example SQL:\n"
         "SELECT c.c_name, o.o_orderkey\n"
         "    FROM public.customer c\n"
         "    JOIN public.orders o ON c.c_custkey = o.o_custkey\n"

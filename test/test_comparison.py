@@ -69,6 +69,117 @@ class ComparisonTests(unittest.TestCase):
         self.assertIsNone(result['difference_rate'])
         self.assertEqual(len(result['unresolved_matches']), 4)
 
+    def test_identical_parallel_aggregate_plan_from_project_brief(self):
+        # Figure 1 has two aggregates over the same input relations. Matching
+        # the partial aggregate must make the remaining root pair resolvable.
+        node = {
+            'Node Type': 'Aggregate', 'Strategy': 'Plain', 'Partial Mode': 'Finalize',
+            'Plans': [{
+                'Node Type': 'Gather', 'Workers Planned': 2,
+                'Plans': [{
+                    'Node Type': 'Aggregate', 'Strategy': 'Plain', 'Partial Mode': 'Partial',
+                    'Plans': [join(scan('lineitem', 'l'), {
+                        'Node Type': 'Hash', 'Plans': [scan('part', 'p')],
+                    })],
+                }],
+            }],
+        }
+        result = compare_plans(node, deepcopy(node))
+        self.assertEqual(len(result['matches']), 7)
+        self.assertEqual(result['difference_rate'], 0)
+        self.assertEqual(result['unresolved_matches'], [])
+        self.assertEqual(result['differences'], [])
+        self.assertTrue(all(n['status'] == 'unchanged' for n in result['node_annotations']))
+
+    def test_repeated_operators_resolve_after_parent_matching(self):
+        for middle in ('Sort', 'Gather'):
+            with self.subTest(middle=middle):
+                node = {
+                    'Node Type': 'Aggregate', 'Strategy': 'Plain',
+                    'Plans': [{
+                        'Node Type': middle,
+                        'Plans': [{
+                            'Node Type': 'Aggregate', 'Strategy': 'Plain',
+                            'Plans': [scan('t')],
+                        }],
+                    }],
+                }
+                result = compare_plans(node, deepcopy(node))
+                self.assertEqual(len(result['matches']), 4)
+                self.assertEqual(result['difference_rate'], 0)
+                self.assertEqual(result['differences'], [])
+
+    def test_uncertain_parent_does_not_prove_child_moved(self):
+        node = {
+            'Node Type': 'Sort',
+            'Plans': [{'Node Type': 'Sort', 'Plans': [scan('t')]}],
+        }
+        result = compare_plans(node, deepcopy(node))
+        self.assertIsNone(result['difference_rate'])
+        self.assertTrue(result['unresolved_matches'])
+        self.assertNotIn('parent_changed', [d['kind'] for d in result['differences']])
+
+    def test_uncertain_children_do_not_prove_order_changed(self):
+        node = join(scan('t'), scan('t'))
+        result = compare_plans(node, deepcopy(node))
+        self.assertIsNone(result['difference_rate'])
+        self.assertNotIn('children_changed', [d['kind'] for d in result['differences']])
+
+    def test_known_child_reorder_is_reported_despite_other_ambiguity(self):
+        pg = {'Node Type': 'Append', 'Plans': [scan('t'), scan('t'), scan('u')]}
+        ai = {'Node Type': 'Append', 'Plans': [scan('u'), scan('t'), scan('t')]}
+        result = compare_plans(pg, ai)
+        self.assertIsNone(result['difference_rate'])
+        self.assertIn('children_changed', [d['kind'] for d in result['differences']])
+
+    def test_different_unmatched_parents_still_report_movement(self):
+        pg = {'Node Type': 'Sort', 'Plans': [scan('t')]}
+        ai = {'Node Type': 'Limit', 'Plans': [scan('t')]}
+        result = compare_plans(pg, ai)
+        self.assertFalse(result['unresolved_matches'])
+        self.assertIn('parent_changed', [d['kind'] for d in result['differences']])
+
+    def test_aggregate_aliases_have_equivalent_strategies(self):
+        for alias, strategy in [('HashAggregate', 'Hashed'), ('GroupAggregate', 'Sorted')]:
+            canonical = {'Node Type': 'Aggregate', 'Strategy': strategy, 'Plans': [scan('t')]}
+            shorthand = {'Node Type': alias, 'Plans': [scan('t')]}
+            for pg, ai in [(canonical, shorthand), (shorthand, canonical)]:
+                with self.subTest(alias=alias, pg_operator=pg['Node Type']):
+                    before = deepcopy((pg, ai))
+                    result = compare_plans(pg, ai)
+                    self.assertEqual(result['difference_rate'], 0)
+                    self.assertEqual(result['differences'], [])
+                    self.assertEqual((pg, ai), before)
+
+    def test_different_aggregate_strategies_still_count(self):
+        pg = {'Node Type': 'Aggregate', 'Strategy': 'Hashed', 'Plans': [scan('t')]}
+        ai = {'Node Type': 'GroupAggregate', 'Plans': [scan('t')]}
+        result = compare_plans(pg, ai)
+        self.assertEqual(len(result['matches']), 2)
+        self.assertEqual(result['difference_rate'], 0.5)
+        self.assertIn('operator_changed', [d['kind'] for d in result['differences']])
+
+    def test_planned_workers_are_compared(self):
+        pg = {'Node Type': 'Gather', 'Workers Planned': 2, 'Plans': [scan('t')]}
+        ai = deepcopy(pg)
+        ai['Workers Planned'] = 8
+        result = compare_plans(pg, ai)
+        self.assertEqual(result['difference_rate'], 0.5)
+        self.assertEqual(len(result['differences']), 1)
+        self.assertEqual(result['differences'][0]['details']['field'], 'Workers Planned')
+
+    def test_subplan_parent_relationship_is_compared(self):
+        pg = {
+            'Node Type': 'Result',
+            'Plans': [dict(scan('t'), **{'Parent Relationship': 'InitPlan'})],
+        }
+        ai = deepcopy(pg)
+        ai['Plans'][0]['Parent Relationship'] = 'SubPlan'
+        result = compare_plans(pg, ai)
+        self.assertEqual(result['difference_rate'], 0.5)
+        self.assertEqual(len(result['differences']), 1)
+        self.assertEqual(result['differences'][0]['details']['field'], 'Parent Relationship')
+
     def test_attributes_index_filter_group_sort(self):
         for field, before, after in [
             ('Filter', "x = 'A  B'", "x = 'A B'"),

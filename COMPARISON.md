@@ -58,16 +58,21 @@ as evidence of how often the AI agrees with PostgreSQL.
    including a root node directly, a Plan wrapper, or an EXPLAIN result array.
 2. **Use consistent names.** For example, Sequential Scan becomes Seq Scan.
    HashAggregate and PostgreSQL's Aggregate with Strategy=Hashed are treated as
-   the same operation.
+   the same operation and strategy. The same applies to GroupAggregate and
+   Aggregate with Strategy=Sorted. Original attributes remain available for display.
 3. **Find corresponding operations.** For each node, collect the tables and
    aliases used by that node and its input operations. Keep repeated occurrences.
    Combine that list with the general operation type, such as scan or join.
    Match a pair when this information identifies exactly one node on each side.
 4. **Use matched parents to resolve more pairs.** Among the remaining children
    of a matched pair, match nodes whose information is unique on both sides.
-   If several candidates remain, mark them uncertain rather than guessing.
+   Repeat steps 3 and 4 until a complete pass adds no matches. A child match may
+   make a previously ambiguous global pair unique. If several candidates remain,
+   mark them uncertain rather than guessing.
 5. **Compare each pair.** Check the operation, selected details, ordered inputs,
-   and position in the tree. Record each difference with an explanation.
+   and position in the tree. Record each definite difference with an explanation.
+   An unresolved correspondence does not itself prove that a node moved or its
+   inputs changed; mark affected pairs uncertain unless a difference is established.
 6. **Return the results.** Include both trees, matched pairs, differences,
    similarities, node statuses, and the difference rate.
 
@@ -83,7 +88,45 @@ aliases must be consistent between the two inputs.
 
 The code checks details such as join type, filters, index names and conditions,
 grouping keys, sort keys, output expressions, scan direction, and parallel settings.
-It also checks whether nodes have different parents or ordered children.
+Parallel settings include Parallel Aware, Partial Mode, and Workers Planned.
+It also checks Parent Relationship (for example, InitPlan versus SubPlan), and
+whether nodes have different parents or ordered children.
+
+The matching procedure can be written as:
+
+```text
+matches = empty one-to-one mapping
+repeat
+    previous_count = size(matches)
+    group all unmatched nodes by (operation family, relation/alias multiset)
+    bind groups containing exactly one node from each plan
+    for each currently matched parent pair
+        group its unmatched immediate children by the same key
+        bind groups containing exactly one child from each plan
+until size(matches) = previous_count
+
+compare each matched pair's canonical operator, strategy, and selected attributes
+compare edges where correspondence is known or a difference can be established
+mark remaining nodes unmatched or uncertain
+return both trees, matches, differences, explanations, and the affected-node rate
+```
+
+For example, consider identical copies of
+`Aggregate -> Gather -> Aggregate -> Hash Join -> scans`. Initially the two
+aggregates share a family and input scope. Matching Gather identifies its child
+aggregate. The next pass can then match the remaining root aggregates. The
+seven-node version in the project brief is covered by an automated regression
+test: all seven pairs match and the difference rate is zero.
+
+Each successful pass adds at least one pair, so there are at most
+`min(PostgreSQL node count, AI node count) + 1` passes, including the final pass
+that makes no progress. With `n` nodes across both trees and bounded names and
+attribute sizes, a conservative expected-time upper bound is `O(n^3)` with
+ordinary hash-table grouping, and worst-case storage is `O(n^2)`. A node's stored
+input scope and path can grow with tree size; scope-based grouping can therefore
+take `O(n^2)` work per pass. These are upper bounds for the current implementation,
+not a claim that typical query plans require cubic work. Deep trees are also
+subject to Python's recursion limit.
 
 The AI summary, assumptions, and suggested new indexes are kept separately. A
 suggested index is not treated as an index actually used by the plan.
@@ -174,6 +217,9 @@ the join inputs differ. Use difference_rate as the main measure under these rule
 
 Node statuses are unchanged, changed, unmatched, or uncertain. The GUI can assign
 colors to these statuses. Unchanged means unchanged in the compared properties.
+A matched pair can be uncertain when its parent or child correspondence remains
+unresolved. If a definite difference is also established, its status is changed;
+the overall rate remains unavailable while any correspondence is unresolved.
 
 Each difference has an ID, kind, PostgreSQL node ID, AI node ID, details, and an
 explanation. One side's ID is null for an unmatched node. The kinds are
@@ -237,6 +283,12 @@ python comparison.py postgres_plan.json ai_plan.json
 
 # Run the automated comparison tests
 python -m unittest discover -s test -p test_comparison.py -v
+
+# Check AI prompts without a database connection or Gemini request
+python -m unittest discover -s test -p test_AI_prompt_gemini.py -v
 ```
 
 The demo saves full JSON results under demo_output/tree_comparison.
+The AI prompt includes the actual user query; its fixed example is labeled as a
+format example. Run `python test/test_AI_prompt_gemini.py --live` only when you
+intend to request a plan from Gemini.
