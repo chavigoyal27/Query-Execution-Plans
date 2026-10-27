@@ -538,18 +538,8 @@ def get_ai_query_execution_plan(
         raise RuntimeError("AI result is not a JSON object.")
 
     has_steps = isinstance(result.get("steps"), list) and bool(result.get("steps"))
-    postgres_plan_keys = (
-        "Node Type",
-        "NodeType",
-        "Plans",
-        "Startup Cost",
-        "Total Cost",
-        "Plan Rows",
-        "Plan Width",
-        "Join Type",
-        "Relation Name",
-    )
-    has_postgres_plan_shape = any(key in result for key in postgres_plan_keys)
+    plan = result.get("Plan", result)
+    has_postgres_plan_shape = isinstance(plan, dict) and isinstance(plan.get("Node Type"), str) and bool(plan["Node Type"].strip())
 
     if not (has_steps or has_postgres_plan_shape):
         raise RuntimeError(
